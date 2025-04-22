@@ -4,35 +4,73 @@ from sklearn.metrics import roc_curve, precision_recall_curve, roc_auc_score, av
 
 from bokeh.layouts import row, column
 from bokeh.models import (
-    ColumnDataSource, Span, Div, CustomJS, Whisker, HoverTool, Title
+    ColumnDataSource, Span, Div, CustomJS, Whisker, HoverTool, Title, Range1d
 )
 from bokeh.plotting import figure, curdoc
 import panel as pn
 from panel.widgets import FloatSlider
 import threading
+import os
+from pathlib import Path
 
 # Initialize Panel with Bokeh extension
 pn.extension()
 
+# Launch Panel server: panel serve interactive_roc_histogram.py   --address 172.26.113.23   --port 5006   --allow-websocket-origin=172.26.113.23:5006
+
 # 1) At the top‐level, capture the Bokeh document
 doc = pn.state.curdoc or curdoc()
 
-# ─── 1) Define your dataset selector ────────────────────────────────────────
-dataset_options = [
-    "mESC_RN112_logof",
-    "mESC_RN111_chipseq",
-    "macrophage",
-]
-dataset_folder = dataset_options[0]  # initial value
-dataset_select = pn.widgets.Select(
-    name="Dataset:",
-    value=dataset_folder,
-    options=dataset_options,
-)
+# ─── Setup ─────────────────────────────────────────────────────────────────
+# Determine script path (works in notebook or script)
+try:
+    script_path = Path(__file__).parent.resolve()
+except NameError:
+    script_path = Path().resolve()
+
+# Build nested structure: Model->Target->DatasetFolder
+models = [d for d in os.listdir(script_path) if d in ("mESC","Macrophage")]
+structure = {}
+for model in models:
+    md = script_path / model
+    if md.is_dir():
+        structure[model] = {}
+        for target in os.listdir(md):
+            td = md / target
+            if td.is_dir():
+                # each subfolder is a dataset folder
+                ds = [d for d in os.listdir(td) if (td / d).is_dir()]
+                if ds:
+                    structure[model][target] = ds
+
+# ─── Widgets ────────────────────────────────────────────────────────────────
+model_select = pn.widgets.Select(name="Model", options=list(structure.keys()), value=models[0])
+target_select = pn.widgets.Select(name="Target", options=list(structure[model_select.value].keys()),
+                       value=list(structure[model_select.value].keys())[0])
+dataset_select = pn.widgets.Select(name="Dataset",
+                        options=structure[model_select.value][target_select.value],
+                        value=structure[model_select.value][target_select.value][0])
+
+# cascade updates
+@pn.depends(model_select.param.value, watch=True)
+def _update_targets(model):
+    tlist = list(structure[model].keys())
+    target_select.options = tlist
+    target_select.value = tlist[0]
+
+@pn.depends(target_select.param.value, watch=True)
+def _update_datasets(target):
+    m = model_select.value
+    dlist = structure[m][target]
+    dataset_select.options = dlist
+    dataset_select.value = dlist[0]
+
+selector_row = pn.Row(model_select, target_select, dataset_select,
+                      sizing_mode='stretch_width', margin=(10,10))
 
 def load_and_precompute(folder):
-    gt = pd.read_csv(f"./{folder}/balanced_ground_truth.csv")
-    inf = pd.read_csv(f"./{folder}/balanced_inferred_network.csv")
+    gt = pd.read_csv(f"{folder}/balanced_ground_truth.csv")
+    inf = pd.read_csv(f"{folder}/balanced_inferred_network.csv")
     df = pd.concat([gt, inf], ignore_index=True)
     y_true = df["true_interaction"].values
     y_scores = df["Score"].values
@@ -119,80 +157,52 @@ def create_loading_spinner():
     
     return spinner
 
-def create_box_and_whisker_plot(box_source):
+class BoxAndWhiskerPlot:
+    def __init__(self, data):
+        self.source = ColumnDataSource(data["box"])
+        self.box_fig = figure(
+            x_range=["TP","FP","TN","FN"],
+            width=400, height=300,
+            title="Score Boxplot",
+            tools=""
+        )
+        # draw the boxes and grab the renderer
+        self.box_renderer = self.box_fig.vbar(
+            x="class", width=0.7,
+            top="q3", bottom="q1",
+            source=self.source,
+            fill_alpha=0.3,
+            line_color="black",
+        )
+
+        # median line
+        self.box_fig.segment(
+            x0="class", y0="q2",
+            x1="class", y1="q2",
+            source=self.source,
+            line_width=2,
+            line_color="black"
+        )
+
+        # whiskers
+        self.whisker = Whisker(source=self.source, base="class",
+                        upper="upper", lower="lower")
+        self.box_fig.add_layout(self.whisker)
+
+        # 4) now create and add the hover tool for the boxes
+        self.box_hover = HoverTool(
+            renderers=[self.box_renderer],
+            tooltips=[
+                ("Class",       "@class"),
+                ("Upper whisker","@upper{0.000}"),
+                ("Q3",          "@q3{0.000}"),
+                ("Median (Q2)", "@q2{0.000}"),
+                ("Q1",          "@q1{0.000}"),
+                ("Lower whisker", "@lower{0.000}")
+            ]
+        )
+        self.box_fig.add_tools(self.box_hover)
     
-    # 3) build the box_plot figure and keep the vbar renderer
-    box_fig = figure(
-        x_range=["TP","FP","TN","FN"],
-        width=400, height=300,
-        title="Score Boxplot",
-        tools=""
-    )
-
-    # draw the boxes and grab the renderer
-    box_renderer = box_fig.vbar(
-        x="class", width=0.7,
-        top="q3", bottom="q1",
-        source=box_source,
-        fill_alpha=0.3,
-        line_color="black",
-    )
-
-    # median line
-    box_fig.segment(
-        x0="class", y0="q2",
-        x1="class", y1="q2",
-        source=box_source,
-        line_width=2,
-        line_color="black"
-    )
-
-    # whiskers
-    whisker = Whisker(source=box_source, base="class",
-                    upper="upper", lower="lower")
-    box_fig.add_layout(whisker)
-
-    # 4) now create and add the hover tool for the boxes
-    box_hover = HoverTool(
-        renderers=[box_renderer],
-        tooltips=[
-            ("Class",       "@class"),
-            ("Upper whisker","@upper{0.000}"),
-            ("Q3",          "@q3{0.000}"),
-            ("Median (Q2)", "@q2{0.000}"),
-            ("Q1",          "@q1{0.000}"),
-            ("Lower whisker", "@lower{0.000}")
-        ]
-    )
-    box_fig.add_tools(box_hover)
-    
-    return box_fig
-
-
-# Load the positive and negative edge score files and calculate metrics
-data = load_and_precompute(dataset_folder)
-box_source = ColumnDataSource(data=data["box"])
-
-# Create a loading spinner that will run when loading different datasets
-spinner = create_loading_spinner()
-
-# Create the TP, FP, TN, FN box and whisker plot
-box_fig = create_box_and_whisker_plot(box_source)
-
-# ─── 3) Create your ColumnDataSources once ────────────────────────────────
-hist_source = ColumnDataSource(data=dict(
-    x   = data["centers"].tolist(),
-    tp  = data["tp_counts"].tolist(),
-    fp  = data["fp_counts"].tolist(),
-    tn  = [0]*len(data["centers"]),
-    fn  = [0]*len(data["centers"]),
-))
-
-pr_source  = ColumnDataSource(data=data["pr"])
-
-# sources for the random curves
-rand_pr_source  = ColumnDataSource(data=data["rand_pr"])
-
 class ROCCurve:
     def __init__(self, data):
         self.roc_source        = ColumnDataSource(data=data["roc"])
@@ -214,36 +224,61 @@ class ROCCurve:
         roc_fig.add_layout(self.roc_metric, 'below')
         roc_fig.add_layout(self.rand_roc_metric, 'below')
         
-        return roc_fig
+        roc_fig.x_range = Range1d(0, 1)
+        roc_fig.y_range = Range1d(0, 1)
         
-
-roc_curve_obj = ROCCurve(data)
-
-pr_fig = figure(width=500, height=400,
+        return roc_fig
+    
+class PRCurve:
+    def __init__(self, data):
+        self.pr_source        = ColumnDataSource(data=data["pr"])
+        
+        self.rand_pr_source  = ColumnDataSource(data=data["rand_pr"])
+        self.pr_threshold_line = Span(location=0.5, dimension='height', line_color='black', line_dash='dashed', line_width=2)
+        self.pr_metric  = Title(text=f"AUPRC: {data['auprc']:.3f}", align="center")
+        self.rand_pr_metric  = Title(text=f"Random: {data['rand_auprc']:.3f}", align="center")
+        self.pr_fig           = self.create_pr_curve()
+    
+    def create_pr_curve(self):
+        pr_fig = figure(width=500, height=400,
                 title="Precision‑Recall Curve",
                 x_axis_label="Recall", y_axis_label="Precision", tools="")
-pr_fig.line('recall', 'precision', source=pr_source, line_width=2, color='green')
-pr_threshold_line = Span(location=0.5, dimension='height',
-                         line_color='black', line_dash='dashed', line_width=2)
-pr_fig.add_layout(pr_threshold_line)
+        pr_fig.line('recall', 'precision', source=self.pr_source, line_width=2, color='green')
+        pr_fig.add_layout(self.pr_threshold_line)
+        pr_fig.add_layout(self.pr_metric, 'below')
+        pr_fig.add_layout(self.rand_pr_metric, 'below')
+        pr_fig.line(
+            'recall', 'precision', source=self.rand_pr_source,
+            line_dash='dashed', color='gray', line_width=2,
+        )
+        
+        pr_fig.x_range = Range1d(0, 1)
+        pr_fig.y_range = Range1d(0, 1)
+        
+        return pr_fig
+        
+# On startup, build the folder path from the three selectors and load metrics
+initial_path = script_path / model_select.value / target_select.value / dataset_select.value
+print(f"Initial load from: {initial_path}")
+data = load_and_precompute(initial_path)
 
-# existing “real” metric titles
+# Create a loading spinner that will run when loading different datasets
+spinner = create_loading_spinner()
 
-pr_metric  = Title(text=f"AUPRC: {data['auprc']:.3f}", align="center")
+# Create the TP, FP, TN, FN box and whisker plot
+box_obj = BoxAndWhiskerPlot(data)
+roc_curve_obj = ROCCurve(data)
+pr_curve_obj = PRCurve(data)
 
-pr_fig.add_layout(pr_metric, 'below')
+# ─── 3) Create your ColumnDataSources once ────────────────────────────────
+hist_source = ColumnDataSource(data=dict(
+    x   = data["centers"].tolist(),
+    tp  = data["tp_counts"].tolist(),
+    fp  = data["fp_counts"].tolist(),
+    tn  = [0]*len(data["centers"]),
+    fn  = [0]*len(data["centers"]),
+))
 
-# NEW: random metric titles, added *below* the real ones
-
-rand_pr_metric  = Title(text=f"Random: {data['rand_auprc']:.3f}", align="center")
-pr_fig.add_layout(rand_pr_metric, 'below')
-
-# ─── add the dashed glyphs ────────────────────────────────────────────────
-
-pr_fig.line(
-    'recall', 'precision', source=rand_pr_source,
-    line_dash='dashed', color='gray', line_width=2,
-)
 
 hist_fig = figure(width=600, height=300, title="Score Distribution",
                    tools="")
@@ -295,69 +330,23 @@ def _update_spans(threshold):
     fp_above  = sum(fp_counts[k:])
     tp_above  = sum(tp_counts[k:])
     roc_curve_obj.roc_threshold_line.location = fp_above/total_neg
-    pr_threshold_line.location             = tp_above/total_pos
+    pr_curve_obj.pr_threshold_line.location             = tp_above/total_pos
     threshold_line.location = threshold
 
-# # 4) Redefine your JS callback to take raw_source instead of raw Python arrays
-# bokeh_slider = slider._widget
-# bokeh_slider.js_on_change('value', CustomJS(args=dict(
-#     threshold_line=threshold_line,
-#     roc_line=roc_curve_obj.roc_threshold_line,
-#     pr_line=pr_threshold_line,
-#     raw_source=raw_source
-# ), code="""
-#     const θ = cb_obj.value;
-#     const centers   = raw_source.data['centers'];
-#     const tp_counts = raw_source.data['raw_tp'];
-#     const fp_counts = raw_source.data['raw_fp'];
-#     const n         = centers.length;
+def update_dataset(event=None):
     
-#     // 1) move the histogram thresh‐line
-#     threshold_line.location = θ;
-
-#     // total positives/negatives (constant)
-#     const total_pos = tp_counts.reduce((a,b)=>a+b,0);
-#     const total_neg = fp_counts.reduce((a,b)=>a+b,0);
-
-#     // find first bin ≥ θ
-#     let k = centers.findIndex(c => c >= θ);
-
-#     // 1) if θ is below your first center, everything is “above” threshold:
-#     //    FPR = FP_above / total_neg = 1,  Recall = TP_above / total_pos = 1
-#     if (k === 0) {
-#     roc_line.location = 1;
-#     pr_line.location  = 1;
-
-#     // 2) if no bin is ≥ θ (θ > max center), nothing is “above” threshold:
-#     //    FPR = 0, Recall = 0
-#     } else if (k === -1) {
-#     roc_line.location = 0;
-#     pr_line.location  = 0;
-
-#     // 3) the normal case
-#     } else {
-#     const fp_above = fp_counts.slice(k).reduce((a,b)=>a+b,0);
-#     const tp_above = tp_counts.slice(k).reduce((a,b)=>a+b,0);
-#     roc_line.location = fp_above / total_neg;
-#     pr_line.location  = tp_above / total_pos;
-#     }
-# """))
-
-
-# 5) Hook up the slider to the throttled event
-# slider.js_on_change('value', callback)
-
-def update_dataset(new_dataset):
-    print("🔄 updating dataset to", new_dataset)
     
     # 1) show spinner immediately
     spinner.value   = True
     spinner.visible = True
+    
+    path = script_path / model_select.value / target_select.value / dataset_select.value
+    print(f'Loading data from: {path}')
 
     # 2) do the heavy lifting in a background thread
     def worker():
         try:
-            d = load_and_precompute(new_dataset)
+            d = load_and_precompute(path)
         except Exception as e:
             print("Error in load_and_precompute:", e)
             return
@@ -376,31 +365,36 @@ def update_dataset(new_dataset):
             # ROC & PR
             roc_curve_obj.roc_source.data.update(d["roc"])
             roc_curve_obj.rand_roc_source.data.update(d["rand_roc"])
-            pr_source.data.update(d["pr"])
-            rand_pr_source.data.update(d["rand_pr"])
+            
+            pr_curve_obj.pr_source.data.update(d["pr"])
+            pr_curve_obj.rand_pr_source.data.update(d["rand_pr"])
+            
             raw_source.data.update({
                 "centers": d["centers"],
                 "raw_tp":  d["tp_counts"],
                 "raw_fp":  d["fp_counts"],
             })
             
+            # Boxplot
+            box_obj.source.data.update(d["box"])
+            
             # titles
             roc_curve_obj.roc_metric.text      = f"AUROC: {d['auroc']:.3f}"
             roc_curve_obj.rand_roc_metric.text = f"Random: {d['rand_auroc']:.3f}"
-            pr_metric.text      = f"AUPRC: {d['auprc']:.3f}"
-            rand_pr_metric.text = f"Random: {d['rand_auprc']:.3f}"
+            pr_curve_obj.pr_metric.text      = f"AUPRC: {d['auprc']:.3f}"
+            pr_curve_obj.rand_pr_metric.text = f"Random: {d['rand_auprc']:.3f}"
             
             # reset spans & slider
             slider.value                            = 0.5
             threshold_line.location                 = 0.5
             roc_curve_obj.roc_threshold_line.location = 0.5
-            pr_threshold_line.location              = 0.5
+            pr_curve_obj.pr_threshold_line.location              = 0.5
             
             # hide spinner
             spinner.value   = False
             spinner.visible = False
 
-        doc.add_next_tick_callback(apply_update)
+        (doc or pn.state.curdoc).add_next_tick_callback(apply_update)
 
     try:
         t = threading.Thread(target=worker, daemon=True)
@@ -411,19 +405,21 @@ def update_dataset(new_dataset):
 
 # Wire the Select to call update_dataset whenever it changes:
 # dataset_select.param.watch(lambda ev: print("SELECTED →", ev.new), 'value')
-dataset_select.param.watch(lambda ev: update_dataset(ev.new), 'value')
+model_select.param.watch(lambda ev: update_dataset(), 'value')
+target_select.param.watch(lambda ev: update_dataset(), 'value')
+dataset_select.param.watch(lambda ev: update_dataset(), 'value')
 
 # Do the initial load:
-update_dataset(dataset_select.value)
+update_dataset()
 
 roc_pane  = pn.pane.Bokeh(roc_curve_obj.roc_fig,  sizing_mode='stretch_both')
-pr_pane   = pn.pane.Bokeh(pr_fig,   sizing_mode='stretch_both')
+pr_pane   = pn.pane.Bokeh(pr_curve_obj.pr_fig,   sizing_mode='stretch_both')
 hist_pane = pn.pane.Bokeh(hist_fig, sizing_mode='stretch_both')
-box_pane  = pn.pane.Bokeh(box_fig,  sizing_mode='stretch_both')
+box_pane  = pn.pane.Bokeh(box_obj.box_fig,  sizing_mode='stretch_both')
 
 # ─── 6) Panel layout ─────────────────────────────────────────────────────
 dashboard = pn.Column(
-    dataset_select,                  # Panel Select
+    selector_row,                  # Panel Select
     pn.Row(roc_pane, pr_pane),       # Panel panes
     pn.Row(hist_pane, box_pane),
     slider,                          # Panel FloatSlider
