@@ -28,45 +28,78 @@ try:
 except NameError:
     script_path = Path().resolve()
 
-# Build nested structure: Model->Target->DatasetFolder
-models = [d for d in os.listdir(script_path) if d in ("mESC","Macrophage")]
-structure = {}
-for model in models:
-    md = script_path / model
-    if md.is_dir():
-        structure[model] = {}
-        for target in os.listdir(md):
-            td = md / target
-            if td.is_dir():
-                # each subfolder is a dataset folder
-                ds = [d for d in os.listdir(td) if (td / d).is_dir()]
-                if ds:
-                    structure[model][target] = ds
+data_dir = script_path / "data"
+
+if not data_dir.is_dir():
+    raise FileNotFoundError(f"Data directory not found: {data_dir}")
+
+def find_input_files(data_dir):
+    feature_sets = [d for d in os.listdir(data_dir) if (data_dir / d).is_dir()]
+    structure = {}
+    for fs in feature_sets:
+        fs_dir = data_dir / fs
+        structure[fs] = {}
+        for model in os.listdir(fs_dir):
+            md = fs_dir / model
+            if md.is_dir():
+                structure[fs][model] = {}
+                for target in os.listdir(md):
+                    td = md / target
+                    if td.is_dir():
+                        ds = [d for d in os.listdir(td) if (td / d).is_dir()]
+                        if ds:
+                            structure[fs][model][target] = ds
+    return structure
+
+structure = find_input_files(data_dir)
 
 # ─── Widgets ────────────────────────────────────────────────────────────────
-model_select = pn.widgets.Select(name="Model", options=list(structure.keys()), value=models[0])
-target_select = pn.widgets.Select(name="Target", options=list(structure[model_select.value].keys()),
-                       value=list(structure[model_select.value].keys())[0])
-dataset_select = pn.widgets.Select(name="Dataset",
-                        options=structure[model_select.value][target_select.value],
-                        value=structure[model_select.value][target_select.value][0])
+feature_select = pn.widgets.Select(
+    name="Feature Set", options=list(structure.keys()),
+    value=list(structure.keys())[0], width=200
+)
+model_select = pn.widgets.Select(
+    name="Trained Model",
+    options=list(structure[feature_select.value].keys()),
+    value=list(structure[feature_select.value].keys())[0], width=200
+)
+target_select = pn.widgets.Select(
+    name="Target Dataset",
+    options=list(structure[feature_select.value][model_select.value].keys()),
+    value=list(structure[feature_select.value][model_select.value].keys())[0], width=200
+)
+dataset_select = pn.widgets.Select(
+    name="Ground Truth",
+    options=structure[feature_select.value][model_select.value][target_select.value],
+    value=structure[feature_select.value][model_select.value][target_select.value][0], width=200
+)
 
 # cascade updates
+@pn.depends(feature_select.param.value, watch=True)
+def _update_models(fs):
+    mlist = list(structure[fs].keys())
+    model_select.options = mlist
+    model_select.value = mlist[0]
+
 @pn.depends(model_select.param.value, watch=True)
 def _update_targets(model):
-    tlist = list(structure[model].keys())
+    fs = feature_select.value
+    tlist = list(structure[fs][model].keys())
     target_select.options = tlist
     target_select.value = tlist[0]
 
 @pn.depends(target_select.param.value, watch=True)
 def _update_datasets(target):
+    fs = feature_select.value
     m = model_select.value
-    dlist = structure[m][target]
+    dlist = structure[fs][m][target]
     dataset_select.options = dlist
     dataset_select.value = dlist[0]
 
-selector_row = pn.Row(model_select, target_select, dataset_select,
-                      sizing_mode='stretch_width', margin=(10,10))
+selector_row = pn.Row(
+    feature_select, model_select, target_select, dataset_select,
+    sizing_mode='stretch_width', margin=(10,10)
+)
 
 def load_and_precompute(folder):
     gt = pd.read_csv(f"{folder}/balanced_ground_truth.csv")
@@ -256,9 +289,38 @@ class PRCurve:
         pr_fig.y_range = Range1d(0, 1)
         
         return pr_fig
+
+class Histogram:
+    def __init__(self, data):
+        self.hist_source = ColumnDataSource(data=dict(
+                x   = data["centers"].tolist(),
+                tp  = data["tp_counts"].tolist(),
+                fp  = data["fp_counts"].tolist(),
+                tn  = [0]*len(data["centers"]),
+                fn  = [0]*len(data["centers"]),
+            ))
+        self.hist_threshold_line = Span(location=0.5, dimension='height', line_color='black', line_dash='dashed', line_width=2)
+        self.hist_fig = self.create_histogram()
+        
+        
+    def create_histogram(self):
+        hist_fig = figure(width=600, height=300, title="Score Distribution", tools="")
+        hist_fig.vbar(x='x', top='fp', width=0.015, color="#4195df", fill_alpha=0.7, source=self.hist_source, legend_label="Negative Score")
+        hist_fig.vbar(x='x', top='tp', width=0.015, color="#dc8634", fill_alpha=0.7, source=self.hist_source, legend_label="Positive Score")
+
+        hist_fig.add_layout(self.hist_threshold_line)
+        
+        legend = hist_fig.legend[0]
+        hist_fig.add_layout(legend, 'below')
+        legend.orientation       = 'horizontal'
+        legend.label_text_align  = 'center'
+        legend.margin = 0
+        legend.padding = 5
+        
+        return hist_fig
         
 # On startup, build the folder path from the three selectors and load metrics
-initial_path = script_path / model_select.value / target_select.value / dataset_select.value
+initial_path = data_dir / feature_select.value / model_select.value / target_select.value / dataset_select.value
 print(f"Initial load from: {initial_path}")
 data = load_and_precompute(initial_path)
 
@@ -269,39 +331,7 @@ spinner = create_loading_spinner()
 box_obj = BoxAndWhiskerPlot(data)
 roc_curve_obj = ROCCurve(data)
 pr_curve_obj = PRCurve(data)
-
-# ─── 3) Create your ColumnDataSources once ────────────────────────────────
-hist_source = ColumnDataSource(data=dict(
-    x   = data["centers"].tolist(),
-    tp  = data["tp_counts"].tolist(),
-    fp  = data["fp_counts"].tolist(),
-    tn  = [0]*len(data["centers"]),
-    fn  = [0]*len(data["centers"]),
-))
-
-
-hist_fig = figure(width=600, height=300, title="Score Distribution",
-                   tools="")
-# hist_fig.vbar(x='x', top='tn', width=0.015, color="#b6cde0", fill_alpha=0.7, source=hist_source)
-# hist_fig.vbar(x='x', top='fn', width=0.015, color="#efc69f", fill_alpha=0.7, source=hist_source)
-hist_fig.vbar(x='x', top='fp', width=0.015, color="#4195df", fill_alpha=0.7, source=hist_source, legend_label="Negative Score")
-hist_fig.vbar(x='x', top='tp', width=0.015, color="#dc8634", fill_alpha=0.7, source=hist_source, legend_label="Positive Score")
-
-threshold_line = Span(location=0.5, dimension='height',
-                      line_color='black', line_dash='dashed', line_width=2)
-hist_fig.add_layout(threshold_line)
-# pull out the auto–created legend
-legend = hist_fig.legend[0]
-
-# put it BELOW the plot, outside the frame:
-hist_fig.add_layout(legend, 'below')
-
-# make it horizontal …
-legend.orientation       = 'horizontal'
-# … and center its labels under each glyph
-legend.label_text_align  = 'center'
-legend.margin = 0
-legend.padding = 5  # or whatever spacing you like
+hist_obj = Histogram(data)
 
 # 2) Create your throttled slider in Python
 slider = FloatSlider(
@@ -329,18 +359,16 @@ def _update_spans(threshold):
     total_neg = sum(fp_counts)
     fp_above  = sum(fp_counts[k:])
     tp_above  = sum(tp_counts[k:])
-    roc_curve_obj.roc_threshold_line.location = fp_above/total_neg
-    pr_curve_obj.pr_threshold_line.location             = tp_above/total_pos
-    threshold_line.location = threshold
+    roc_curve_obj.roc_threshold_line.location   = fp_above/total_neg
+    pr_curve_obj.pr_threshold_line.location     = tp_above/total_pos
+    hist_obj.hist_threshold_line.location       = threshold
 
 def update_dataset(event=None):
-    
-    
     # 1) show spinner immediately
     spinner.value   = True
     spinner.visible = True
     
-    path = script_path / model_select.value / target_select.value / dataset_select.value
+    path = data_dir / feature_select.value / model_select.value / target_select.value / dataset_select.value
     print(f'Loading data from: {path}')
 
     # 2) do the heavy lifting in a background thread
@@ -355,7 +383,7 @@ def update_dataset(event=None):
         def apply_update():
             print("Applying update")
             # histogram
-            hist_source.data.update({
+            hist_obj.hist_source.data.update({
                 "x":  d["centers"],
                 "tp": d["tp_counts"],
                 "fp": d["fp_counts"],
@@ -385,10 +413,10 @@ def update_dataset(event=None):
             pr_curve_obj.rand_pr_metric.text = f"Random: {d['rand_auprc']:.3f}"
             
             # reset spans & slider
-            slider.value                            = 0.5
-            threshold_line.location                 = 0.5
-            roc_curve_obj.roc_threshold_line.location = 0.5
-            pr_curve_obj.pr_threshold_line.location              = 0.5
+            slider.value                                = 0.5
+            hist_obj.hist_threshold_line.location       = 0.5
+            roc_curve_obj.roc_threshold_line.location   = 0.5
+            pr_curve_obj.pr_threshold_line.location     = 0.5
             
             # hide spinner
             spinner.value   = False
@@ -414,7 +442,7 @@ update_dataset()
 
 roc_pane  = pn.pane.Bokeh(roc_curve_obj.roc_fig,  sizing_mode='stretch_both')
 pr_pane   = pn.pane.Bokeh(pr_curve_obj.pr_fig,   sizing_mode='stretch_both')
-hist_pane = pn.pane.Bokeh(hist_fig, sizing_mode='stretch_both')
+hist_pane = pn.pane.Bokeh(hist_obj.hist_fig, sizing_mode='stretch_both')
 box_pane  = pn.pane.Bokeh(box_obj.box_fig,  sizing_mode='stretch_both')
 
 # ─── 6) Panel layout ─────────────────────────────────────────────────────
