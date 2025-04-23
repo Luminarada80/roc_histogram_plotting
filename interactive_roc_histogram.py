@@ -102,6 +102,7 @@ ground_truth_select = pn.widgets.Select(
     options=list(structure[feature_select.value][model_select.value][target_select.value].keys()),
     value=list(structure[feature_select.value][model_select.value][target_select.value].keys())[0], width=shared_width
 )
+
 sample_select = pn.widgets.Select(
     name="Sample Select",
     options=structure[feature_select.value][model_select.value][target_select.value][ground_truth_select.value],
@@ -142,7 +143,7 @@ def _update_sample(event):
     sample_select.value   = ds[0]
 
 selector_row = pn.Row(
-    feature_select, model_select, target_select, ground_truth_select, sample_select,
+    feature_select, sample_select, model_select, target_select, ground_truth_select, 
     sizing_mode='stretch_width', margin=(10,10)
 )
 
