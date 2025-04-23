@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import math
 from sklearn.metrics import roc_curve, precision_recall_curve, roc_auc_score, average_precision_score
 
 from bokeh.layouts import row, column
@@ -33,45 +34,78 @@ data_dir = script_path / "data"
 if not data_dir.is_dir():
     raise FileNotFoundError(f"Data directory not found: {data_dir}")
 
-def find_input_files(data_dir):
-    feature_sets = [d for d in os.listdir(data_dir) if (data_dir / d).is_dir()]
-    structure = {}
-    for fs in feature_sets:
+def find_input_files(data_dir: Path):
+    """
+    Walks data_dir/<feature_set>/<model>/<target>/<sample>/
+    and collects all immediate subdirectories (ds) under each sample.
+
+    Returns a nested dict:
+      structure[feature_set][model][target][sample] = [ds1, ds2, …]
+    """
+    structure: dict = {}
+    for fs in os.listdir(data_dir):
         fs_dir = data_dir / fs
+        if not fs_dir.is_dir():
+            continue
         structure[fs] = {}
+
+        # model layer
         for model in os.listdir(fs_dir):
-            md = fs_dir / model
-            if md.is_dir():
-                structure[fs][model] = {}
-                for target in os.listdir(md):
-                    td = md / target
-                    if td.is_dir():
-                        ds = [d for d in os.listdir(td) if (td / d).is_dir()]
-                        if ds:
-                            structure[fs][model][target] = ds
+            model_dir = fs_dir / model
+            if not model_dir.is_dir():
+                continue
+            structure[fs][model] = {}
+
+            # target layer
+            for target in os.listdir(model_dir):
+                target_dir = model_dir / target
+                if not target_dir.is_dir():
+                    continue
+                structure[fs][model][target] = {}
+
+                # sample layer (new)
+                for sample in os.listdir(target_dir):
+                    sample_dir = target_dir / sample
+                    if not sample_dir.is_dir():
+                        continue
+
+                    # the final ds directories under each sample
+                    ds_list = [
+                        d for d in os.listdir(sample_dir)
+                        if (sample_dir / d).is_dir()
+                    ]
+                    if ds_list:
+                        structure[fs][model][target][sample] = ds_list
+
     return structure
 
 structure = find_input_files(data_dir)
 
 # ─── Widgets ────────────────────────────────────────────────────────────────
+shared_width = 175
 feature_select = pn.widgets.Select(
     name="Feature Set", options=list(structure.keys()),
-    value=list(structure.keys())[0], width=200
+    value=list(structure.keys())[0], width=shared_width
 )
 model_select = pn.widgets.Select(
     name="Trained Model",
     options=list(structure[feature_select.value].keys()),
-    value=list(structure[feature_select.value].keys())[0], width=200
+    value=list(structure[feature_select.value].keys())[0], width=shared_width
 )
 target_select = pn.widgets.Select(
     name="Target Dataset",
     options=list(structure[feature_select.value][model_select.value].keys()),
-    value=list(structure[feature_select.value][model_select.value].keys())[0], width=200
+    value=list(structure[feature_select.value][model_select.value].keys())[0], width=shared_width
 )
-dataset_select = pn.widgets.Select(
+ground_truth_select = pn.widgets.Select(
     name="Ground Truth",
-    options=structure[feature_select.value][model_select.value][target_select.value],
-    value=structure[feature_select.value][model_select.value][target_select.value][0], width=200
+    options=list(structure[feature_select.value][model_select.value][target_select.value].keys()),
+    value=list(structure[feature_select.value][model_select.value][target_select.value].keys())[0], width=shared_width
+)
+sample_select = pn.widgets.Select(
+    name="Sample Select",
+    options=structure[feature_select.value][model_select.value][target_select.value][ground_truth_select.value],
+    value=structure[feature_select.value][model_select.value][target_select.value][ground_truth_select.value][0], width=shared_width
 )
 
 # cascade updates
@@ -89,15 +123,26 @@ def _update_targets(model):
     target_select.value = tlist[0]
 
 @pn.depends(target_select.param.value, watch=True)
-def _update_datasets(target):
-    fs = feature_select.value
+def _update_ground_truth(event):
+    f = feature_select.value
     m = model_select.value
-    dlist = structure[fs][m][target]
-    dataset_select.options = dlist
-    dataset_select.value = dlist[0]
+    t = target_select.value
+    gt_opts = list(structure[f][m][t].keys())
+    ground_truth_select.options = gt_opts
+    ground_truth_select.value   = gt_opts[0]
+
+@pn.depends(ground_truth_select.param.value, watch=True)
+def _update_sample(event):
+    f = feature_select.value
+    m = model_select.value
+    t = target_select.value
+    gt = ground_truth_select.value
+    ds = structure[f][m][t][gt]
+    sample_select.options = ds
+    sample_select.value   = ds[0]
 
 selector_row = pn.Row(
-    feature_select, model_select, target_select, dataset_select,
+    feature_select, model_select, target_select, ground_truth_select, sample_select,
     sizing_mode='stretch_width', margin=(10,10)
 )
 
@@ -108,8 +153,8 @@ def load_and_precompute(folder):
     y_true = df["true_interaction"].values
     y_scores = df["Score"].values
     
-    # Subsample every 10th score for the auroc and auprc
-    idx = np.arange(0, len(y_scores), 10)
+    # Subsample every 20th score for the auroc and auprc
+    idx = np.arange(0, len(y_scores), math.ceil(len(y_scores)*0.0001))
     y_true_ss   = y_true[idx]
     y_scores_ss = y_scores[idx]
 
@@ -320,7 +365,7 @@ class Histogram:
         return hist_fig
         
 # On startup, build the folder path from the three selectors and load metrics
-initial_path = data_dir / feature_select.value / model_select.value / target_select.value / dataset_select.value
+initial_path = data_dir / feature_select.value / model_select.value / target_select.value / ground_truth_select.value / sample_select.value
 print(f"Initial load from: {initial_path}")
 data = load_and_precompute(initial_path)
 
@@ -335,7 +380,7 @@ hist_obj = Histogram(data)
 
 # 2) Create your throttled slider in Python
 slider = FloatSlider(
-    start=0.0, end=1.0, value=0.5, step=0.01,
+    start=0.0, end=1.0, value=0.5, step=0.005,
     name="Score Threshold"
 )
 
@@ -368,7 +413,7 @@ def update_dataset(event=None):
     spinner.value   = True
     spinner.visible = True
     
-    path = data_dir / feature_select.value / model_select.value / target_select.value / dataset_select.value
+    path = data_dir / feature_select.value / model_select.value / target_select.value / ground_truth_select.value / sample_select.value
     print(f'Loading data from: {path}')
 
     # 2) do the heavy lifting in a background thread
@@ -435,7 +480,8 @@ def update_dataset(event=None):
 # dataset_select.param.watch(lambda ev: print("SELECTED →", ev.new), 'value')
 model_select.param.watch(lambda ev: update_dataset(), 'value')
 target_select.param.watch(lambda ev: update_dataset(), 'value')
-dataset_select.param.watch(lambda ev: update_dataset(), 'value')
+ground_truth_select.param.watch(lambda ev: update_dataset(), 'value')
+sample_select.param.watch(lambda ev: update_dataset(), 'value')
 
 # Do the initial load:
 update_dataset()
