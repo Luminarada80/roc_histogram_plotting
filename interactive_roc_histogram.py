@@ -5,9 +5,10 @@ from sklearn.metrics import roc_curve, precision_recall_curve, roc_auc_score, av
 
 from bokeh.layouts import row, column
 from bokeh.models import (
-    ColumnDataSource, Span, Div, CustomJS, Whisker, HoverTool, Title, Range1d
+    ColumnDataSource, Span, Div, CustomJS, Whisker, HoverTool, Title, Range1d, TapTool
 )
 from bokeh.plotting import figure, curdoc
+from bokeh.palettes import Category10
 import panel as pn
 from panel.widgets import FloatSlider
 import threading
@@ -35,48 +36,25 @@ if not data_dir.is_dir():
     raise FileNotFoundError(f"Data directory not found: {data_dir}")
 
 def find_input_files(data_dir: Path):
-    """
-    Walks data_dir/<feature_set>/<model>/<target>/<sample>/
-    and collects all immediate subdirectories (ds) under each sample.
-
-    Returns a nested dict:
-      structure[feature_set][model][target][sample] = [ds1, ds2, …]
-    """
-    structure: dict = {}
+    structure = {}
     for fs in os.listdir(data_dir):
         fs_dir = data_dir / fs
-        if not fs_dir.is_dir():
-            continue
+        if not fs_dir.is_dir(): continue
         structure[fs] = {}
-
-        # model layer
         for model in os.listdir(fs_dir):
             model_dir = fs_dir / model
-            if not model_dir.is_dir():
-                continue
+            if not model_dir.is_dir(): continue
             structure[fs][model] = {}
-
-            # target layer
             for target in os.listdir(model_dir):
                 target_dir = model_dir / target
-                if not target_dir.is_dir():
-                    continue
+                if not target_dir.is_dir(): continue
                 structure[fs][model][target] = {}
-
-                # sample layer (new)
-                for sample in os.listdir(target_dir):
-                    sample_dir = target_dir / sample
-                    if not sample_dir.is_dir():
-                        continue
-
-                    # the final ds directories under each sample
-                    ds_list = [
-                        d for d in os.listdir(sample_dir)
-                        if (sample_dir / d).is_dir()
-                    ]
+                for gt in os.listdir(target_dir):
+                    gt_dir = target_dir / gt
+                    if not gt_dir.is_dir(): continue
+                    ds_list = [d for d in os.listdir(gt_dir) if (gt_dir / d).is_dir()]
                     if ds_list:
-                        structure[fs][model][target][sample] = ds_list
-
+                        structure[fs][model][target][gt] = ds_list
     return structure
 
 structure = find_input_files(data_dir)
@@ -84,29 +62,38 @@ structure = find_input_files(data_dir)
 # ─── Widgets ────────────────────────────────────────────────────────────────
 shared_width = 175
 feature_select = pn.widgets.Select(
-    name="Feature Set", options=list(structure.keys()),
-    value=list(structure.keys())[0], width=shared_width
+    name="Feature Set",
+    options=list(structure.keys()),
+    value=list(structure.keys())[0],
+    width=shared_width
 )
 model_select = pn.widgets.Select(
     name="Trained Model",
     options=list(structure[feature_select.value].keys()),
-    value=list(structure[feature_select.value].keys())[0], width=shared_width
+    value=list(structure[feature_select.value].keys())[0],
+    width=shared_width
 )
 target_select = pn.widgets.Select(
     name="Target Dataset",
     options=list(structure[feature_select.value][model_select.value].keys()),
-    value=list(structure[feature_select.value][model_select.value].keys())[0], width=shared_width
+    value=list(structure[feature_select.value][model_select.value].keys())[0],
+    width=shared_width
 )
 ground_truth_select = pn.widgets.Select(
     name="Ground Truth",
     options=list(structure[feature_select.value][model_select.value][target_select.value].keys()),
-    value=list(structure[feature_select.value][model_select.value][target_select.value].keys())[0], width=shared_width
+    value=list(structure[feature_select.value][model_select.value][target_select.value].keys())[0],
+    width=shared_width
 )
-
 sample_select = pn.widgets.Select(
     name="Sample Select",
     options=structure[feature_select.value][model_select.value][target_select.value][ground_truth_select.value],
     value=structure[feature_select.value][model_select.value][target_select.value][ground_truth_select.value][0], width=shared_width
+)
+
+selector_row = pn.Row(
+    feature_select, model_select, target_select, ground_truth_select,
+    sizing_mode='stretch_width', margin=(10,10)
 )
 
 # cascade updates
@@ -131,7 +118,7 @@ def _update_ground_truth(event):
     gt_opts = list(structure[f][m][t].keys())
     ground_truth_select.options = gt_opts
     ground_truth_select.value   = gt_opts[0]
-
+    
 @pn.depends(ground_truth_select.param.value, watch=True)
 def _update_sample(event):
     f = feature_select.value
@@ -142,99 +129,110 @@ def _update_sample(event):
     sample_select.options = ds
     sample_select.value   = ds[0]
 
-selector_row = pn.Row(
-    feature_select, sample_select, model_select, target_select, ground_truth_select, 
-    sizing_mode='stretch_width', margin=(10,10)
-)
-
-def load_and_precompute(folder):
-    gt = pd.read_csv(f"{folder}/balanced_ground_truth.csv")
-    inf = pd.read_csv(f"{folder}/balanced_inferred_network.csv")
-    df = pd.concat([gt, inf], ignore_index=True)
-    y_true = df["true_interaction"].values
-    y_scores = df["Score"].values
-    
-    # Subsample every 20th score for the auroc and auprc
-    idx = np.arange(0, len(y_scores), math.ceil(len(y_scores)*0.0001))
-    y_true_ss   = y_true[idx]
-    y_scores_ss = y_scores[idx]
-
-    # ROC & PR
-    fpr, tpr, _   = roc_curve(y_true_ss, y_scores_ss)
-    prec, rec, _  = precision_recall_curve(y_true_ss, y_scores_ss)
-    
-    auroc = roc_auc_score(y_true_ss, y_scores_ss)
-    auprc = average_precision_score(y_true_ss, y_scores_ss)
-    
-    # randomized uniform scores
-    rand_scores        = np.random.uniform(0, 1, size=len(y_scores_ss))
-    r_fpr, r_tpr, _    = roc_curve(y_true_ss, rand_scores)
-    r_prec, r_rec, _   = precision_recall_curve(y_true_ss, rand_scores)
-    rand_auroc         = roc_auc_score(y_true_ss, rand_scores)
-    rand_auprc         = average_precision_score(y_true_ss, rand_scores)
-    
-    # histogram bins
-    bins       = np.linspace(0, 1, 50)
-    centers    = (bins[:-1] + bins[1:]) / 2
-    idx        = np.clip(np.digitize(y_scores, bins) - 1, 0, len(centers)-1)
-    tp_counts  = np.bincount(idx[y_true==1], minlength=len(centers))
-    fp_counts  = np.bincount(idx[y_true==0], minlength=len(centers))
-    
-    thresh = 0.5
-    raw = {
-        "TP": y_scores[(y_true==1) & (y_scores>=thresh)],
-        "FP": y_scores[(y_true==0) & (y_scores>=thresh)],
-        "TN": y_scores[(y_true==0) & (y_scores< thresh)],
-        "FN": y_scores[(y_true==1) & (y_scores< thresh)],
-    }
-    # compute boxplot stats
-    box = {"class":[],"q1":[],"q2":[],"q3":[],"lower":[],"upper":[]}
-    for cls, arr in raw.items():
-        cls = str(cls)
-        q1,q2,q3 = np.percentile(arr, [25,50,75])
-        iqr      = q3 - q1
-        low_wh   = max(arr.min(), q1-1.5*iqr)
-        high_wh  = min(arr.max(), q3+1.5*iqr)
-        box["class"].append(cls)
-        box["q1"].append(q1)
-        box["q2"].append(q2)
-        box["q3"].append(q3)
-        box["lower"].append(low_wh)
-        box["upper"].append(high_wh)
-
-    return {
-        "bins":       bins,
-        "centers":    centers,
-        "tp_counts":  tp_counts,
-        "fp_counts":  fp_counts,
-        "total_pos":  int((y_true==1).sum()),
-        "total_neg":  int((y_true==0).sum()),
-        "roc":        dict(fpr=fpr, tpr=tpr),
-        "pr":         dict(recall=rec, precision=prec),
-        "rand_roc":   dict(fpr=r_fpr, tpr=r_tpr),
-        "rand_pr":    dict(recall=r_rec, precision=r_prec),
-        "box":        box,
-        "auroc":      auroc,
-        "auprc":      auprc,
-        "rand_auroc": rand_auroc,
-        "rand_auprc": rand_auprc,
-    }
-
+# Spinner
 def create_loading_spinner():
     spinner = pn.indicators.LoadingSpinner(
         name='Loading', value=False, visible=False,
-        width=50, height=50,
+        width=50, height=50
     )
-    # apply inline styles so it always floats in the exact center:
     spinner.styles = {
-        'position' : 'fixed',
-        'top'      : '45%',
-        'left'     : '40%',
-        'transform': 'translate(-40%, -45%)',
-        'z-index'  : '10000',
+        'position':'fixed','top':'45%','left':'40%',
+        'transform':'translate(-40%,-45%)','z-index':'10000'
     }
-    
     return spinner
+
+def on_line_selected(attr, old, new):
+    # new is a list of selected line‐indices; we only care about the first
+    if new:
+        idx = new[0]
+        # pull the sample name out of the CDS
+        sel_sample = shared_source.data['sample'][idx]
+        # drive the Panel widget
+        sample_select.value = sel_sample
+
+def load_and_precompute(sample_paths):
+    # allow passing a single Path or a list
+    if isinstance(sample_paths, Path):
+        paths = [sample_paths]
+    else:
+        paths = sample_paths
+
+    all_results = []
+    for folder in paths:
+        # load balanced csvs
+        gt  = pd.read_csv(folder / "balanced_ground_truth.csv")
+        inf = pd.read_csv(folder / "balanced_inferred_network.csv")
+        df  = pd.concat([gt, inf], ignore_index=True)
+
+        y_true   = df["true_interaction"].values
+        y_scores = df["Score"].values
+
+        # subsample
+        step = max(1, math.ceil(len(y_scores) * 0.0001))
+        idx = np.arange(0, len(y_scores), step)
+        y_true_ss   = y_true[idx]
+        y_scores_ss = y_scores[idx]
+
+        # ROC & PR
+        fpr, tpr, _         = roc_curve(y_true_ss, y_scores_ss)
+        prec, rec, _        = precision_recall_curve(y_true_ss, y_scores_ss)
+        auroc               = roc_auc_score(y_true_ss, y_scores_ss)
+        auprc               = average_precision_score(y_true_ss, y_scores_ss)
+
+        # random baseline
+        rand_scores         = np.random.rand(len(y_scores_ss))
+        r_fpr, r_tpr, _     = roc_curve(y_true_ss, rand_scores)
+        r_prec, r_rec, _    = precision_recall_curve(y_true_ss, rand_scores)
+        rand_auroc          = roc_auc_score(y_true_ss, rand_scores)
+        rand_auprc          = average_precision_score(y_true_ss, rand_scores)
+
+        # histogram
+        bins      = np.linspace(0,1,50)
+        centers   = (bins[:-1] + bins[1:]) / 2
+        bin_idx   = np.clip(np.digitize(y_scores, bins)-1, 0, len(centers)-1)
+        tp_counts = np.bincount(bin_idx[y_true==1], minlength=len(centers))
+        fp_counts = np.bincount(bin_idx[y_true==0], minlength=len(centers))
+
+        # boxplot (at threshold 0.5)
+        thresh = 0.5
+        raw = {
+          "TP": y_scores[(y_true==1) & (y_scores>=thresh)],
+          "FP": y_scores[(y_true==0) & (y_scores>=thresh)],
+          "TN": y_scores[(y_true==0) & (y_scores< thresh)],
+          "FN": y_scores[(y_true==1) & (y_scores< thresh)],
+        }
+        box = {"class":[], "q1":[], "q2":[], "q3":[], "lower":[], "upper":[]}
+        for cls, arr in raw.items():
+            q1,q2,q3 = np.percentile(arr, [25,50,75])
+            iqr       = q3 - q1
+            low_wh    = max(arr.min(), q1 - 1.5*iqr)
+            high_wh   = min(arr.max(), q3 + 1.5*iqr)
+            box["class"].append(cls)
+            box["q1"].append(q1)
+            box["q2"].append(q2)
+            box["q3"].append(q3)
+            box["lower"].append(low_wh)
+            box["upper"].append(high_wh)
+
+        all_results.append({
+            "bins":       bins,
+            "centers":    centers.tolist(),
+            "tp_counts":  tp_counts.tolist(),
+            "fp_counts":  fp_counts.tolist(),
+            "total_pos":  int((y_true==1).sum()),
+            "total_neg":  int((y_true==0).sum()),
+            "roc":        {"fpr": fpr.tolist(), "tpr": tpr.tolist()},
+            "pr":         {"recall": rec.tolist(), "precision": prec.tolist()},
+            "rand_roc":   {"fpr": r_fpr.tolist(), "tpr": r_tpr.tolist()},
+            "rand_pr":    {"recall": r_rec.tolist(), "precision": r_prec.tolist()},
+            "box":        box,
+            "auroc":      auroc,
+            "auprc":      auprc,
+            "rand_auroc": rand_auroc,
+            "rand_auprc": rand_auprc,
+        })
+
+    return all_results
 
 class BoxAndWhiskerPlot:
     def __init__(self, data):
@@ -339,9 +337,9 @@ class PRCurve:
 class Histogram:
     def __init__(self, data):
         self.hist_source = ColumnDataSource(data=dict(
-                x   = data["centers"].tolist(),
-                tp  = data["tp_counts"].tolist(),
-                fp  = data["fp_counts"].tolist(),
+                x   = data["centers"],
+                tp  = data["tp_counts"],
+                fp  = data["fp_counts"],
                 tn  = [0]*len(data["centers"]),
                 fn  = [0]*len(data["centers"]),
             ))
@@ -364,20 +362,86 @@ class Histogram:
         legend.padding = 5
         
         return hist_fig
-        
-# On startup, build the folder path from the three selectors and load metrics
-initial_path = data_dir / feature_select.value / model_select.value / target_select.value / ground_truth_select.value / sample_select.value
-print(f"Initial load from: {initial_path}")
-data = load_and_precompute(initial_path)
 
-# Create a loading spinner that will run when loading different datasets
 spinner = create_loading_spinner()
+    
+fs = feature_select.value
+md = model_select.value
+td = target_select.value
+gt = ground_truth_select.value
 
-# Create the TP, FP, TN, FN box and whisker plot
-box_obj = BoxAndWhiskerPlot(data)
-roc_curve_obj = ROCCurve(data)
-pr_curve_obj = PRCurve(data)
-hist_obj = Histogram(data)
+samples      = structure[fs][md][td][gt]
+base_dir     = data_dir / fs / md / td / gt
+sample_paths = [base_dir / s for s in samples]
+sample = sample_select.value
+single_sample_path = base_dir / sample
+
+results = load_and_precompute(sample_paths)
+single_sample_result = load_and_precompute(single_sample_path)
+single_sample = single_sample_result[0]
+
+# now build the single‐sample plots from that dict
+box_obj   = BoxAndWhiskerPlot(single_sample)
+roc_obj   = ROCCurve(single_sample)
+pr_obj    = PRCurve(single_sample)
+hist_obj  = Histogram(single_sample)
+
+hist_obj.hist_fig.title = f"Score Distribution for {sample}"
+
+# 1) Create your multi‐line sources *with* a `color` column
+shared_source = ColumnDataSource(dict(
+    roc_xs   = [],   # list   of list[float]
+    roc_ys   = [],   # list   of list[float]
+    pr_xs    = [],   # list   of list[float]
+    pr_ys    = [],   # list   of list[float]
+    sample   = [],   # list   of str
+    color    = [],   # list   of str
+))
+
+roc_renderer = roc_obj.roc_fig.multi_line(
+    xs='roc_xs', ys='roc_ys',
+    source=shared_source,
+    line_color='color',
+    line_width=2,
+    selection_line_color="color",
+    selection_line_width=4,
+    nonselection_line_alpha=0.2,
+)
+roc_obj.roc_fig.add_tools(HoverTool(
+    renderers=[roc_renderer],
+    tooltips=[("Sample","@sample")],
+    line_policy="nearest"
+))
+roc_obj.roc_fig.add_tools(TapTool(renderers=[roc_renderer]))
+roc_obj.roc_fig.toolbar.active_tap = roc_obj.roc_fig.select_one(TapTool)
+
+# PR
+pr_renderer = pr_obj.pr_fig.multi_line(
+    xs='pr_xs', ys='pr_ys',
+    source=shared_source,
+    line_color='color',
+    line_width=2,
+    selection_line_color="color",
+    selection_line_width=4,
+    nonselection_line_alpha=0.2,
+)
+pr_obj.pr_fig.add_tools(HoverTool(
+    renderers=[pr_renderer],
+    tooltips=[("Sample","@sample")],
+    line_policy="nearest"
+))
+pr_obj.pr_fig.add_tools(TapTool(renderers=[pr_renderer]))
+pr_obj.pr_fig.toolbar.active_tap = pr_obj.pr_fig.select_one(TapTool)
+
+# hide the single‐line renderers if you want:
+roc_obj.roc_fig.renderers = [
+    r for r in roc_obj.roc_fig.renderers 
+    if getattr(r.glyph, 'glyph', None) is None
+]
+pr_obj.pr_fig.renderers = [
+    r for r in pr_obj.pr_fig.renderers 
+    if getattr(r.glyph, 'glyph', None) is None
+]
 
 # 2) Create your throttled slider in Python
 slider = FloatSlider(
@@ -387,9 +451,9 @@ slider = FloatSlider(
 
 # 3.5) Create a SECOND source to hold the un‐thresholded bin data
 raw_source = ColumnDataSource(data=dict(
-    centers = data["centers"].tolist(),
-    raw_tp  = data["tp_counts"].tolist(),
-    raw_fp  = data["fp_counts"].tolist(),
+    centers = single_sample["centers"],
+    raw_tp  = single_sample["tp_counts"],
+    raw_fp  = single_sample["fp_counts"],
 ))
 
 # this function will run *server‑side* whenever slider.value changes
@@ -405,77 +469,129 @@ def _update_spans(threshold):
     total_neg = sum(fp_counts)
     fp_above  = sum(fp_counts[k:])
     tp_above  = sum(tp_counts[k:])
-    roc_curve_obj.roc_threshold_line.location   = fp_above/total_neg
-    pr_curve_obj.pr_threshold_line.location     = tp_above/total_pos
+    roc_obj.roc_threshold_line.location   = fp_above/total_neg
+    pr_obj.pr_threshold_line.location     = tp_above/total_pos
     hist_obj.hist_threshold_line.location       = threshold
 
 def update_dataset(event=None):
-    # 1) show spinner immediately
-    spinner.value   = True
+    spinner.value = True
     spinner.visible = True
-    
-    path = data_dir / feature_select.value / model_select.value / target_select.value / ground_truth_select.value / sample_select.value
-    print(f'Loading data from: {path}')
 
-    # 2) do the heavy lifting in a background thread
+    fs, md, td, gt = (
+        feature_select.value,
+        model_select.value,
+        target_select.value,
+        ground_truth_select.value,
+    )
+    samples      = structure[fs][md][td][gt]
+    base_dir     = data_dir / fs / md / td / gt
+    sample_paths = [base_dir / s for s in samples]
+    sample = sample_select.value
+    single_sample_path = base_dir / sample
+
     def worker():
-        try:
-            d = load_and_precompute(path)
-        except Exception as e:
-            print("Error in load_and_precompute:", e)
-            return
+        # 0) clear the old single‐sample curves
+        roc_obj.roc_source.data      = {'fpr': [], 'tpr': []}
+        roc_obj.rand_roc_source.data = {'fpr': [], 'tpr': []}
+        pr_obj.pr_source.data        = {'recall': [], 'precision': []}
+        pr_obj.rand_pr_source.data   = {'recall': [], 'precision': []}
         
-        # 3) schedule the UI updates under the doc lock
+        # 1) Load everything in this background thread
+        results = load_and_precompute(sample_paths)
+        single_sample_result = load_and_precompute(single_sample_path)
+        single_sample = single_sample_result[0]
+
+        # 2) Prepare data for the UI
+        # d0       = results[0]
+        # hist_data = dict(
+        #     x  = d0["centers"],
+        #     tp = d0["tp_counts"],
+        #     fp = d0["fp_counts"],
+        #     tn = [0] * len(d0["centers"]),
+        #     fn = [0] * len(d0["centers"]),
+        # )
+        box_data = single_sample["box"]
+        hist_data = dict(
+                x   = single_sample["centers"],
+                tp  = single_sample["tp_counts"],
+                fp  = single_sample["fp_counts"],
+                tn  = [0]*len(single_sample["centers"]),
+                fn  = [0]*len(single_sample["centers"]),
+            )
+
+        roc_xs = [r["roc"]["fpr"]      for r in results]
+        roc_ys = [r["roc"]["tpr"]      for r in results]
+        pr_xs  = [r["pr"]["recall"]    for r in results]
+        pr_ys  = [r["pr"]["precision"] for r in results]
+
+        # compute averages
+        avg_auroc   = np.mean([r["auroc"]     for r in results])
+        avg_auprc   = np.mean([r["auprc"]     for r in results])
+        avg_rand_au = np.mean([r["rand_auroc"]for r in results])
+        avg_rand_pr = np.mean([r["rand_auprc"]for r in results])
+
+        # pick palette
+        n = len(samples)
+        if n == 1:
+            palette = ['navy']
+        else:
+            # pick between Category10[3] and Category10[10], then slice to n
+            from bokeh.palettes import Category10
+            pal   = Category10[max(3, min(10, n))]
+            palette = (pal * ((n // len(pal))+1))[:n]
+
         def apply_update():
-            print("Applying update")
+            # ALL model mutations happen here, on the main thread:
+
             # histogram
-            hist_obj.hist_source.data.update({
-                "x":  d["centers"],
-                "tp": d["tp_counts"],
-                "fp": d["fp_counts"],
-                "tn": [0]*len(d["centers"]),
-                "fn": [0]*len(d["centers"]),
-            })
-            # ROC & PR
-            roc_curve_obj.roc_source.data.update(d["roc"])
-            roc_curve_obj.rand_roc_source.data.update(d["rand_roc"])
+            hist_obj.hist_source.data.update(hist_data)
+
+            # boxplot
+            box_obj.source.data.update(box_data)
             
-            pr_curve_obj.pr_source.data.update(d["pr"])
-            pr_curve_obj.rand_pr_source.data.update(d["rand_pr"])
-            
-            raw_source.data.update({
-                "centers": d["centers"],
-                "raw_tp":  d["tp_counts"],
-                "raw_fp":  d["fp_counts"],
-            })
-            
-            # Boxplot
-            box_obj.source.data.update(d["box"])
-            
-            # titles
-            roc_curve_obj.roc_metric.text      = f"AUROC: {d['auroc']:.3f}"
-            roc_curve_obj.rand_roc_metric.text = f"Random: {d['rand_auroc']:.3f}"
-            pr_curve_obj.pr_metric.text      = f"AUPRC: {d['auprc']:.3f}"
-            pr_curve_obj.rand_pr_metric.text = f"Random: {d['rand_auprc']:.3f}"
-            
-            # reset spans & slider
-            slider.value                                = 0.5
+            shared_source.data = dict(
+                roc_xs = roc_xs,      # list of lists
+                roc_ys = roc_ys,
+                pr_xs  = pr_xs,
+                pr_ys  = pr_ys,
+                sample = samples,
+                color  = palette,
+            )
+
+            # update average metrics in titles
+            roc_obj.roc_metric.text      = f"Avg AUROC: {avg_auroc:.3f}"
+            roc_obj.rand_roc_metric.text     = f"Rand AUROC: {avg_rand_au:.3f}"
+            pr_obj.pr_metric.text        = f"Avg AUPRC: {avg_auprc:.3f}"
+            pr_obj.rand_pr_metric.text      = f"Rand AUPRC: {avg_rand_pr:.3f}"
+
+            # reset the threshold lines & slider
+            slider.value = 0.5
             hist_obj.hist_threshold_line.location       = 0.5
-            roc_curve_obj.roc_threshold_line.location   = 0.5
-            pr_curve_obj.pr_threshold_line.location     = 0.5
-            
+            roc_obj.roc_threshold_line.location  = 0.5
+            pr_obj.pr_threshold_line.location   = 0.5
+
             # hide spinner
             spinner.value   = False
             spinner.visible = False
 
-        (doc or pn.state.curdoc).add_next_tick_callback(apply_update)
+        # hand it off to the main document
+        doc.add_next_tick_callback(apply_update)
 
-    try:
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
-    except Exception as e:
-        print("Failed to start worker thread:", e)
+    threading.Thread(target=worker, daemon=True).start()
 
+def _on_sample_change(event):
+    new_sample = event.new
+
+    # 1) update the hist title
+    hist_obj.hist_fig.title.text = f"Score Distribution for {new_sample}"
+
+    # 2) (optional) also update the boxplot title, if you want
+    box_obj.box_fig.title.text  = f"Score Boxplot for {new_sample}"
+
+    # 3) only clear the line selection if it wasn't a tap‐driven change:
+    sel = shared_source.selected.indices
+    if not (len(sel)==1 and shared_source.data['sample'][sel[0]] == new_sample):
+        shared_source.selected.indices = []
 
 # Wire the Select to call update_dataset whenever it changes:
 # dataset_select.param.watch(lambda ev: print("SELECTED →", ev.new), 'value')
@@ -483,12 +599,16 @@ model_select.param.watch(lambda ev: update_dataset(), 'value')
 target_select.param.watch(lambda ev: update_dataset(), 'value')
 ground_truth_select.param.watch(lambda ev: update_dataset(), 'value')
 sample_select.param.watch(lambda ev: update_dataset(), 'value')
+sample_select.param.watch(_on_sample_change, 'value')
+
+shared_source.selected.on_change('indices', on_line_selected)
+
 
 # Do the initial load:
 update_dataset()
 
-roc_pane  = pn.pane.Bokeh(roc_curve_obj.roc_fig,  sizing_mode='stretch_both')
-pr_pane   = pn.pane.Bokeh(pr_curve_obj.pr_fig,   sizing_mode='stretch_both')
+roc_pane  = pn.pane.Bokeh(roc_obj.roc_fig,  sizing_mode='stretch_both')
+pr_pane   = pn.pane.Bokeh(pr_obj.pr_fig,   sizing_mode='stretch_both')
 hist_pane = pn.pane.Bokeh(hist_obj.hist_fig, sizing_mode='stretch_both')
 box_pane  = pn.pane.Bokeh(box_obj.box_fig,  sizing_mode='stretch_both')
 
@@ -496,6 +616,7 @@ box_pane  = pn.pane.Bokeh(box_obj.box_fig,  sizing_mode='stretch_both')
 dashboard = pn.Column(
     selector_row,                  # Panel Select
     pn.Row(roc_pane, pr_pane),       # Panel panes
+    pn.Row(sample_select, sizing_mode='stretch_width', margin=(10,10)),
     pn.Row(hist_pane, box_pane),
     slider,                          # Panel FloatSlider
 )
