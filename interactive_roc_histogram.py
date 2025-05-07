@@ -18,10 +18,17 @@ from pathlib import Path
 # Initialize Panel with Bokeh extension
 pn.extension()
 
+"""
+TODO
+Random line went away on AUROC and AUPRC
+Sample Select doesn't remove sample names from selection when updating
+"""
 # Launch Panel server: panel serve interactive_roc_histogram.py   --address 172.26.113.23   --port 5006   --allow-websocket-origin=172.26.113.23:5006
 
 # 1) At the top‐level, capture the Bokeh document
 doc = pn.state.curdoc or curdoc()
+
+suppress_sample_callback = False
 
 # ─── Setup ─────────────────────────────────────────────────────────────────
 # Determine script path (works in notebook or script)
@@ -141,15 +148,6 @@ def create_loading_spinner():
     }
     return spinner
 
-def on_line_selected(attr, old, new):
-    # new is a list of selected line‐indices; we only care about the first
-    if new:
-        idx = new[0]
-        # pull the sample name out of the CDS
-        sel_sample = shared_source.data['sample'][idx]
-        # drive the Panel widget
-        sample_select.value = sel_sample
-
 def load_and_precompute(sample_paths):
     # allow passing a single Path or a list
     if isinstance(sample_paths, Path):
@@ -233,6 +231,59 @@ def load_and_precompute(sample_paths):
         })
 
     return all_results
+
+
+def on_line_selected(attr, old, new):
+    if new:
+        idx = new[0]
+        sel_sample = shared_source.data['sample'][idx]
+
+        update_single_sample_plot(sel_sample)
+
+def update_single_sample_plot(sample_name):
+    global suppress_sample_callback
+    
+    fs = feature_select.value
+    md = model_select.value
+    td = target_select.value
+    gt = ground_truth_select.value
+    sample_path = data_dir / fs / md / td / gt / sample_name
+
+    result = load_and_precompute(sample_path)[0]
+
+    # Update histogram
+    hist_data = dict(
+        x  = result["centers"],
+        tp = result["tp_counts"],
+        fp = result["fp_counts"],
+        tn = [0] * len(result["centers"]),
+        fn = [0] * len(result["centers"]),
+    )
+    hist_obj.hist_source.data.update(hist_data)
+    hist_obj.hist_fig.title.text = f"Score Distribution for {sample_name}"
+
+    # Update boxplot
+    box_obj.source.data.update(result["box"])
+    box_obj.box_fig.title.text = f"Score Boxplot for {sample_name}"
+
+    # Update raw source for thresholding
+    raw_source.data = dict(
+        centers = result["centers"],
+        raw_tp  = result["tp_counts"],
+        raw_fp  = result["fp_counts"],
+    )
+
+    # Reset threshold slider and lines
+    slider.value = 0.5
+    hist_obj.hist_threshold_line.location = 0.5
+    roc_obj.roc_threshold_line.location   = 0.5
+    pr_obj.pr_threshold_line.location     = 0.5
+    
+    suppress_sample_callback = True
+    sample_select.value = sample_name
+    suppress_sample_callback = False
+
+
 
 class BoxAndWhiskerPlot:
     def __init__(self, data):
@@ -477,14 +528,31 @@ def update_dataset(event=None):
     spinner.value = True
     spinner.visible = True
 
+    # Force full refresh of dependent widgets
+    _update_models(feature_select.value)
+    _update_targets(model_select.value)
+    _update_ground_truth(None)
+    _update_sample(None)
+
     fs, md, td, gt = (
         feature_select.value,
         model_select.value,
         target_select.value,
         ground_truth_select.value,
     )
+    
     samples      = structure[fs][md][td][gt]
     base_dir     = data_dir / fs / md / td / gt
+    # Get current sample name and update sample options
+    current_sample = sample_select.value
+    sample_select.options = samples
+
+    # If the current sample name is not valid in the new list, set a default
+    if current_sample not in samples:
+        sample_select.value = samples[0]  # default to the first available sample
+    else:
+        sample_select.value = current_sample
+        
     sample_paths = [base_dir / s for s in samples]
     sample = sample_select.value
     single_sample_path = base_dir / sample
@@ -580,6 +648,11 @@ def update_dataset(event=None):
     threading.Thread(target=worker, daemon=True).start()
 
 def _on_sample_change(event):
+    global suppress_sample_callback
+
+    if suppress_sample_callback:
+        return  # Don't trigger full reload
+    
     new_sample = event.new
 
     # 1) update the hist title
@@ -592,13 +665,19 @@ def _on_sample_change(event):
     sel = shared_source.selected.indices
     if not (len(sel)==1 and shared_source.data['sample'][sel[0]] == new_sample):
         shared_source.selected.indices = []
+        
+def _sample_callback(ev):
+    global suppress_sample_callback
+    if not suppress_sample_callback:
+        update_dataset()
 
 # Wire the Select to call update_dataset whenever it changes:
 # dataset_select.param.watch(lambda ev: print("SELECTED →", ev.new), 'value')
+feature_select.param.watch(lambda ev: update_dataset(), 'value')
 model_select.param.watch(lambda ev: update_dataset(), 'value')
 target_select.param.watch(lambda ev: update_dataset(), 'value')
 ground_truth_select.param.watch(lambda ev: update_dataset(), 'value')
-sample_select.param.watch(lambda ev: update_dataset(), 'value')
+sample_select.param.watch(_sample_callback, 'value')
 sample_select.param.watch(_on_sample_change, 'value')
 
 shared_source.selected.on_change('indices', on_line_selected)
